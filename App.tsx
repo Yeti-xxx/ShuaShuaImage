@@ -30,12 +30,14 @@ import {
   shuffle,
   STORAGE_KEY,
 } from './src/utils/photoHistory';
+import VideoPlayer from './src/components/VideoPlayer';
+import {NativeModules} from 'react-native';
 
 const {height: SCREEN_H, width: SCREEN_W} = Dimensions.get('window');
 
-/** 为底部统计卡 + 删除按钮预留高度，避免与照片相框重叠 */
+/** 为底部统计卡 + 分享/删除按钮预留高度，避免与照片相框重叠 */
 const BOTTOM_UI_RESERVE =
-  Platform.OS === 'ios' ? 178 : 118;
+  Platform.OS === 'ios' ? 230 : 178;
 
 const STATS_KEY = '@shuashua_daily_stats_v1';
 
@@ -54,7 +56,14 @@ const theme = {
   textMuted: 'rgba(148, 163, 184, 0.95)',
 };
 
-type PhotoItem = {uri: string; width: number; height: number};
+type MediaItem = {
+  uri: string;
+  filepath: string | null;
+  width: number;
+  height: number;
+  type: 'image' | 'video';
+  duration: number;
+};
 
 async function requestAndroidGallery(): Promise<boolean> {
   if (Platform.OS !== 'android') {
@@ -64,6 +73,7 @@ async function requestAndroidGallery(): Promise<boolean> {
   const perms: string[] = [];
   if (api >= 33) {
     perms.push(PermissionsAndroid.PERMISSIONS.READ_MEDIA_IMAGES);
+    perms.push(PermissionsAndroid.PERMISSIONS.READ_MEDIA_VIDEO);
   } else {
     perms.push(PermissionsAndroid.PERMISSIONS.READ_EXTERNAL_STORAGE);
   }
@@ -133,11 +143,12 @@ function ScreenChrome({children}: {children: React.ReactNode}) {
 export default function App(): JSX.Element {
   const [loading, setLoading] = useState(true);
   const [permissionOk, setPermissionOk] = useState(false);
-  const [photos, setPhotos] = useState<PhotoItem[]>([]);
+  const [photos, setPhotos] = useState<MediaItem[]>([]);
   const [currentIndex, setCurrentIndex] = useState(0);
+  const [viewableIndex, setViewableIndex] = useState(0);
   const [deletedToday, setDeletedToday] = useState(0);
 
-  const listRef = useRef<FlatList<PhotoItem>>(null);
+  const listRef = useRef<FlatList<MediaItem>>(null);
 
   const refreshPhotos = useCallback(async () => {
     setLoading(true);
@@ -148,14 +159,20 @@ export default function App(): JSX.Element {
 
       const res = await CameraRoll.getPhotos({
         first: 2000,
-        assetType: 'Photos',
+        assetType: 'All',
       });
 
-      const all: PhotoItem[] = res.edges.map(e => ({
-        uri: e.node.image.uri,
-        width: e.node.image.width,
-        height: e.node.image.height,
-      }));
+      const all: MediaItem[] = res.edges.map(e => {
+        const isVideo = e.node.type.includes('video');
+        return {
+          uri: e.node.image.uri,
+          filepath: e.node.image.filepath,
+          width: e.node.image.width,
+          height: e.node.image.height,
+          type: isVideo ? 'video' : 'image',
+          duration: isVideo ? e.node.image.playableDuration : 0,
+        };
+      });
 
       const now = Date.now();
       const available = all.filter(p => !isUriInCooldown(p.uri, hist, now));
@@ -211,7 +228,10 @@ export default function App(): JSX.Element {
         viewableItems: ViewToken[];
       }) => {
         const first = viewableItems[0];
-        const item = first?.item as PhotoItem | undefined;
+        if (first?.index != null) {
+          setViewableIndex(first.index);
+        }
+        const item = first?.item as MediaItem | undefined;
         if (item?.uri) {
           markViewedRef.current(item.uri);
         }
@@ -248,6 +268,21 @@ export default function App(): JSX.Element {
           ? '请在系统弹出的删除确认里点「允许」；点「拒绝」或关闭则不会删除。'
           : `${m || '请检查相册权限。Android 11+ 删除会走系统确认框。'}`,
       );
+    }
+  };
+
+  const shareCurrentMedia = async () => {
+    const p = photos[currentIndex];
+    if (!p) {
+      return;
+    }
+    try {
+      await NativeModules.NativeShare.share(
+        p.uri,
+        p.type === 'video' ? 'video/mp4' : 'image/jpeg',
+      );
+    } catch (e: any) {
+      Alert.alert('分享失败', String(e?.message || '未知错误'));
     }
   };
 
@@ -376,18 +411,26 @@ export default function App(): JSX.Element {
           setCurrentIndex(Math.min(Math.max(0, idx), photos.length - 1));
         }}
         viewabilityConfigCallbackPairs={viewabilityConfigCallbackPairs}
-        renderItem={({item}) => (
+        renderItem={({item, index}) => (
           <View
             style={[
               styles.page,
               {width: SCREEN_W, height: SCREEN_H, paddingBottom: BOTTOM_UI_RESERVE},
             ]}>
             <View style={styles.imageFrame}>
-              <Image
-                source={{uri: item.uri}}
-                style={styles.image}
-                resizeMode="contain"
-              />
+              {item.type === 'video' ? (
+                <VideoPlayer
+                  uri={item.uri}
+                  isVisible={index === viewableIndex}
+                  duration={item.duration}
+                />
+              ) : (
+                <Image
+                  source={{uri: item.uri}}
+                  style={styles.image}
+                  resizeMode="contain"
+                />
+              )}
             </View>
           </View>
         )}
@@ -431,6 +474,21 @@ export default function App(): JSX.Element {
 
         <Pressable
           style={({pressed}) => [
+            styles.shareBtnWrap,
+            pressed && styles.shareBtnPressed,
+          ]}
+          onPress={shareCurrentMedia}>
+          <LinearGradient
+            colors={['#6366f1', theme.accent]}
+            start={{x: 0, y: 0}}
+            end={{x: 1, y: 1}}
+            style={styles.shareBtnGrad}>
+            <Text style={styles.shareBtnText}>📤 分享</Text>
+          </LinearGradient>
+        </Pressable>
+
+        <Pressable
+          style={({pressed}) => [
             styles.delBtnWrap,
             pressed && styles.delBtnPressed,
           ]}
@@ -440,7 +498,9 @@ export default function App(): JSX.Element {
               start={{x: 0, y: 0}}
               end={{x: 1, y: 1}}
               style={styles.delBtnGrad}>
-              <Text style={styles.delBtnText}>⚡ 删除当前照片</Text>
+              <Text style={styles.delBtnText}>
+                ⚡ 删除当前{photos[currentIndex]?.type === 'video' ? '视频' : '照片'}
+              </Text>
             </LinearGradient>
           </Pressable>
         <Text style={styles.hint}>左右滑切换 · 不喜欢的就删掉</Text>
@@ -646,6 +706,31 @@ const styles = StyleSheet.create({
     fontWeight: '600',
     letterSpacing: 0.4,
     textTransform: 'uppercase',
+  },
+  shareBtnWrap: {
+    borderRadius: 28,
+    overflow: 'hidden',
+    marginBottom: 10,
+    ...Platform.select({
+      ios: {
+        shadowColor: '#6366f1',
+        shadowOffset: {width: 0, height: 4},
+        shadowOpacity: 0.35,
+        shadowRadius: 10,
+      },
+      android: {elevation: 6},
+    }),
+  },
+  shareBtnPressed: {opacity: 0.92, transform: [{scale: 0.985}]},
+  shareBtnGrad: {
+    paddingVertical: 14,
+    alignItems: 'center',
+  },
+  shareBtnText: {
+    color: '#fff',
+    fontSize: 16,
+    fontWeight: '700',
+    letterSpacing: 0.3,
   },
   delBtnWrap: {
     borderRadius: 28,
